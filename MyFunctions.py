@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from scipy.optimize import curve_fit
+from scipy.integrate import simps, trapezoid
 import gdspy
 
 #%% GREY-SCALE LITHOGRAPHY GDS GENERATION
@@ -98,6 +99,8 @@ def steps_gap(step_size, gap, length, grey_levels, name):
 
 def rings(cavity_radius, resol, function, grey_levels, nominal_dose, name):
     
+    gdspy.current_library = gdspy.GdsLibrary()
+    
     if function[0] == 'sigmoid':
         x_left = np.linspace(-cavity_radius, 0, int(cavity_radius / resol))
         x_right = np.linspace(0, cavity_radius, int(cavity_radius / resol))
@@ -105,6 +108,8 @@ def rings(cavity_radius, resol, function, grey_levels, nominal_dose, name):
         x_all = np.concatenate((x_left,x_right))
         
         y = sigmoid(x_left / function[1] + function[2])
+        print(type(y))
+        y = y/max(y)
 
         # Further scaling according the number of grey levels wanted
         scaled_y = - grey_levels * (y - 1) - 255 # grey level
@@ -156,7 +161,7 @@ def rings(cavity_radius, resol, function, grey_levels, nominal_dose, name):
     lib = generate_concentric_rings((0, 0), radii[::-1])
     generate_save_gds(name, lib)
     
-    return x_left, scaled_y, radii
+    return x_all, dose_all, radii
 
 #%% GREY-SCALE ANALYSIS AND CONTRAST CURVE
 def remove_dose_points(profile_file, removed_begin, removed_end):
@@ -295,45 +300,175 @@ def read_tab_separated_file(filename):
     return column1, column2
 
 #%% MECHANICAL PROFIMOMETRY
-def leveling(x, z):
+def leveling(x, z, level_range):
+    x.reset_index(drop=True, inplace=True)
+    z.reset_index(drop=True, inplace=True)
+    # Convert range in um to indexes
+    indices = x.index[x <= x[0] + level_range].tolist()
     # Extract the first and last range of elements
-    new_x = pd.concat([x.head(1000), x.tail(20)])
-    new_z = pd.concat([z.head(1000), z.tail(20)])
+    new_x = pd.concat([x.head(indices[-1]), x.tail(indices[-1])])
+    new_z = pd.concat([z.head(indices[-1]), z.tail(indices[-1])])
+    
+    coeffs = np.polyfit(new_x, new_z, 1)
+    z_level = []
+    for i in range(len(x)):
+        z_level.append(z[i] - coeffs[0]*x.iloc[i] - coeffs[1])
+    return pd.DataFrame({'z leveled':z_level})
+
+def leveling_headonly(x, z, level_range):
+    # Convert range in um to indexes
+    length_range = len(list(filter(lambda x: x < level_range, x)))
+    # Extract the first and last range of elements
+    new_x = x.head(length_range)
+    new_z = z.head(length_range)
     coeffs = np.polyfit(new_x, new_z, 1)
     z_level = []
     for i in range(len(x)):
         z_level.append(z[i] - coeffs[0]*x[i] - coeffs[1])
     return pd.DataFrame({'z leveled':z_level})
 
-def leveling_headonly(x, z):
-    # Extract the first and last range of elements
-    new_x = x.head(100)
-    new_z = z.head(100)
-    coeffs = np.polyfit(new_x, new_z, 1)
-    z_level = []
-    for i in range(len(x)):
-        z_level.append(z[i] - coeffs[0]*x[i] - coeffs[1])
-    return pd.DataFrame({'z leveled':z_level})
-
-def plot_profiles(filenames, title, leveling_opt):
+def plot_profiles(filenames, title):
     plt.figure()
     for file in filenames:
-        column1, column2 = read_tab_separated_file(file[0])
-        data = pd.DataFrame({'xy': column1, 'z': column2})
-        if len(file) > 2:
-            data['xy'] += file[2]
-        if(leveling_opt == 0):
-            data['z leveled'] = leveling(data['xy'], data['z'])
-        else:
-            data['z leveled'] = leveling_headonly(data['xy'], data['z'])
-            print('Etching depth = ',np.mean(data['z leveled'].iloc[-100:]))
-        plt.plot(data['xy'], data['z leveled'], marker='.', markersize = 1, linestyle='-', label=file[1])
-    plt.xlabel('xy dimension [um]')
-    plt.ylabel('z dimension [nm]')
+        leveling_opt = file[4]
+        level_range = file[5]
+        if file[3] == 'KLA':
+            column1, column2 = read_tab_separated_file(file[0])
+            data = pd.DataFrame({'xy': column1, 'z': column2})
+            if(leveling_opt == 0):
+                data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+            else:
+                data['z leveled'] = leveling_headonly(data['xy'], data['z'], level_range)
+                print('Etching depth = ',np.mean(data['z leveled'].iloc[-100:]))
+            if len(file) > 2:
+                data['xy'] += file[2]
+            plt.plot([x/1 for x in data['xy']], [x/1 for x in data['z leveled']], marker='.', markersize = 1, linestyle='-', label=file[1])
+        if file[3] == 'Dektak':
+            # column1, column2 = read_tab_separated_file(file[0])
+            data = pd.read_csv(file[0], skiprows = 29)
+            data.columns = ['xy', 'z', 'aa', 'aa']
+            data = data.drop(['aa'], axis = 1)
+            data['z'] /= 10
+            if(leveling_opt == 0):
+                data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+            else:
+                data['z leveled'] = leveling_headonly(data['xy'], data['z'], level_range)
+                print('Etching depth = ',np.mean(data['z leveled'].iloc[-100:]))
+            if len(file) > 2:
+                data['xy'] += file[2]
+            plt.plot(data['xy'], data['z leveled'], marker='.', markersize = 1, linestyle='-', label=file[1])
+    plt.xlabel('Radius [um]')
+    plt.ylabel('Depth [nm]')
     plt.title(title)
     plt.legend()
     plt.grid(True)
     plt.show()
+
+
+def plot_profiles_step(filenames, title):
+    plt.figure()
+    for file in filenames:
+        leveling_opt = file[4]
+        level_range = file[5]
+        if file[3] == 'KLA':
+            column1, column2 = read_tab_separated_file(file[0])
+            data = pd.DataFrame({'xy': column1, 'z': column2})
+            if(leveling_opt == 'y'):
+                data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+            else:
+                data['z leveled'] = leveling_headonly(data['xy'], data['z'], level_range)
+                print('Etching depth = ',np.mean(data['z leveled'].iloc[-100:]))
+            if len(file) > 2:
+                data['xy'] += file[2]
+            plt.plot([x/1 for x in data['xy']], [x/1 for x in data['z leveled']], marker='.', markersize = 1, linestyle='-', label=file[1])
+        if file[3] == 'Dektak':
+            # column1, column2 = read_tab_separated_file(file[0])
+            data = pd.read_csv(file[0], skiprows = 29)
+            data.columns = ['xy', 'z', 'aa', 'aa']
+            data = data.drop(['aa'], axis = 1)
+            data['z'] /= 10
+            if(leveling_opt == 'y'):
+                data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+            else:
+                data['z leveled'] = leveling_headonly(data['xy'], data['z'], level_range)
+                print('Etching depth = ',np.mean(data['z leveled'].iloc[-100:]))
+            if len(file) > 2:
+                data['xy'] += file[2]
+            plt.plot(data['xy'], data['z leveled'], marker='.', markersize = 1, linestyle='-', label=file[1])
+    plt.xlabel('Lateral dimension [um]')
+    # plt.ylabel('Vertical dimension [nm]')
+    plt.title(title)
+    plt.legend(loc='upper left')
+    plt.grid(True)
+    plt.show()
+
+def uniform_cavity_find_slope(file):
+    data = pd.read_csv(file, skiprows = 29)
+    data.columns = ['xy', 'z', 'aa', 'aa']
+    data = data.drop(['aa'], axis = 1)
+    data['z'] /= 10
+    # data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+    data['z leveled'] = leveling(data['xy'], data['z'], 100)
+    drop_loc = data['xy'].loc[data['z leveled'] < -1000]
+    return drop_loc.iloc[0]
+
+def uniform_cavity_depth(file, start, stop, level_range):
+    data = pd.read_csv(file, skiprows = 29)
+    data.columns = ['xy', 'z', 'aa', 'aa']
+    data = data.drop(['aa'], axis = 1)
+    data['z'] /= 10
+    # data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+    data['z leveled'] = leveling(data['xy'].loc[(data['xy'] >= start) & (data['xy'] <= stop)], 
+                                  data['z'].loc[(data['xy'] >= start) & (data['xy'] <= stop)], level_range)
+    depth = np.mean(data['z leveled'].loc[(data['xy'] >= 2 * level_range) &
+                                           (data['xy'] <= stop - start - 2 * level_range)])
+    plt.figure()
+    plt.plot(data['xy'].loc[(data['xy'] <= stop)], 
+             data['z leveled'].loc[(data['xy'] <= stop)])
+    plt.plot(data['xy'].loc[(data['xy'] <= level_range)], 
+             data['z leveled'].loc[(data['xy'] <= level_range)], color='red')
+    plt.plot(data['xy'].loc[(data['xy'] <= stop - start) & (data['xy'] >= stop - start - level_range)], 
+             data['z leveled'].loc[(data['xy'] <= stop - start) & (data['xy'] >= stop - start -level_range)], color='red')
+    plt.plot(data['xy'].loc[(data['xy'] >= 2 *  level_range) & (data['xy'] <= stop - start - 2 *  level_range)], 
+             data['z leveled'].loc[(data['xy'] >= 2 *  level_range) & (data['xy'] <= stop - start - 2 *  level_range)], color='red')
+    plt.grid()
+    return depth
+
+def plot_profiles_range(filenames, title, show_plot=True):
+    if show_plot:
+        plt.figure()
+    for file in filenames:
+        leveling_opt = file[4]
+        level_range = file[5]
+        if file[3] == 'KLA':
+            column1, column2 = read_tab_separated_file(file[0])
+            data = pd.DataFrame({'xy': column1, 'z': column2})
+        if file[3] == 'Dektak':
+            # column1, column2 = read_tab_separated_file(file[0])
+            data = pd.read_csv(file[0], skiprows = 29)
+            data.columns = ['xy', 'z', 'aa', 'aa']
+            data = data.drop(['aa'], axis = 1)
+            data['z'] /= 10
+            
+        if(leveling_opt == 0):
+            data['z leveled'] = leveling(data['xy'], data['z'], level_range)
+        else:
+            data['z leveled'] = leveling_headonly(data['xy'], data['z'], level_range)
+            print('Etching depth = ',np.mean(data['z leveled'].iloc[-100:]))
+        if len(file) > 2:
+            data['xy'] += file[2]
+        if show_plot:
+            plt.plot(data['xy'].loc[(data['xy'] > file[6]) & (data['xy'] < file[7])], data['z leveled'].loc[(data['xy'] > file[6]) & (data['xy'] < file[7])], marker='.', markersize = 1, linestyle='-', label=file[1])
+    if show_plot:
+        plt.xlabel('xy dimension [um]')
+        plt.ylabel('z dimension [nm]')
+        # plt.ylim((-5000, 2000))
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+            
+    return data['xy'].loc[(data['xy'] > file[6]) & (data['xy'] < file[7])], data['z leveled'].loc[(data['xy'] > file[6]) & (data['xy'] < file[7])]
 
 def plot_entry_profile_comparison(filenames,title):
     plt.figure()
@@ -395,3 +530,76 @@ def profile_averaging(filenames, title):
     plt.tight_layout()
     # plt.show()
     return means, std_devs
+
+def roughness_calc(profile_xy, profile_z, inter_deg):
+    coefficients = np.polyfit(profile_xy, profile_z, inter_deg)
+    polynomial = np.poly1d(coefficients)
+
+    z_interpolated = polynomial(profile_xy)
+
+    plt.figure()
+    plt.plot(profile_xy, profile_z)
+    plt.plot(profile_xy, z_interpolated)
+    plt.grid()
+    plt.xlabel('XY dimension [um]')
+    plt.ylabel('Z dimension [nm]')
+    
+    lms = (sum((profile_z-z_interpolated)**2)/len(profile_z))**0.5
+    
+    print("Least squares: ", np.round(lms,2), "[nm]")
+    
+    return lms
+
+def cavity_volume(profile_xy, profile_z):
+    
+    depth = np.floor(min(profile_z/10))
+    
+    coefficients = np.polyfit(profile_xy, profile_z, 15)
+    polynomial = np.poly1d(coefficients)
+    
+    plt.figure()
+    plt.plot(profile_xy, profile_z, label = 'data')
+    plt.plot(profile_xy, polynomial(profile_xy), label = 'interpolation')
+    plt.grid()
+    plt.xlabel('XY dimension [um]')
+    plt.ylabel('Z dimension [nm]')
+    plt.legend()
+    
+    volume_tot = 0
+    radii = []
+    
+    coefficients[-1] += 500 # This was added for w8 otherwise it was not working
+    for i in range(0,np.abs(int(depth)) - 1):
+    # coefficients[-1] += np.abs(int(depth)) - 10
+    # for i in range(np.abs(int(depth)) - 10,np.abs(int(depth)) - 1):
+        
+        roots = np.roots(coefficients)
+        real_roots = roots[np.isclose(roots.imag, 0)].real
+    
+        smallest_positive_root = np.min(real_roots[real_roots > 0]) if np.any(real_roots > 0) else None
+        highest_negative_root = np.max(real_roots[real_roots < 0]) if np.any(real_roots < 0) else None
+        
+        if(smallest_positive_root == None):
+            smallest_positive_root = -highest_negative_root
+        if(highest_negative_root == None):
+            highest_negative_root = -smallest_positive_root
+        
+        # print(smallest_positive_root)
+        # print(highest_negative_root)
+        # plt.figure()
+        # plt.plot(profile_xy, polynomial(profile_xy))
+        
+        radius = (smallest_positive_root - highest_negative_root) / 2
+        
+        radii.append(radius)
+        
+        vol = np.pi * radius**2 * 0.01
+        
+        volume_tot += vol
+        
+        coefficients[-1] += 10
+        # print(vol)
+    
+    volume_tot /= 1E6
+
+    return volume_tot
